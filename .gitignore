@@ -1,5 +1,6 @@
 # Specific
 .claude
+!isaac_model/model.safetensors.index.json   
 
 
 # Byte-compiled / optimized / DLL files
