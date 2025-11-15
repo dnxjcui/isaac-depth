@@ -1,3 +1,6 @@
 [submodule "perceptron"]
 	path = perceptron
 	url = https://github.com/perceptron-ai-inc/perceptron.git
+[submodule "Depth-Anything-V2"]
+	path = Depth-Anything-V2
+	url = https://github.com/DepthAnything/Depth-Anything-V2
