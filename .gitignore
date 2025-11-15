@@ -170,7 +170,6 @@ __marimo__/
 # Model files - Machine Learning / AI
 # Safetensors (Hugging Face models)
 *.safetensors
-*.safetensors.index.json
 
 # PyTorch models
 *.pt
