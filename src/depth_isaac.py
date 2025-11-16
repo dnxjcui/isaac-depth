@@ -92,12 +92,111 @@ from modular_isaac import (
     create_text_event,
     compute_position_ids_input_ids,
     IsaacRotaryEmbedding,
+    Siglip2SequenceVisionTransformer,
 )
 
+# Import torchvision for depth preprocessing
+import torchvision.transforms as T
+
 
 # ============================================================================
-# Depth Positional Encoding (New)
+# Depth Preprocessing Module
 # ============================================================================
+
+
+class IsaacDepthPreproc(nn.Module):
+    """Depth preprocessing module for DepthAnythingV2 input preparation."""
+
+    def __init__(self, input_size: int = 518):
+        """Initialize depth preprocessing.
+
+        Args:
+            input_size: Target input size for DepthAnythingV2 (default: 518)
+        """
+        super().__init__()
+        self.resize = T.Resize(
+            (input_size, input_size),
+            interpolation=T.InterpolationMode.BILINEAR,
+            antialias=True,
+        )
+        self.normalize = T.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Preprocess images for depth model.
+
+        Args:
+            x: Input tensor of shape (B, C, H, W), values in 0-255 or 0-1 range
+
+        Returns:
+            Preprocessed tensor ready for DepthAnythingV2
+        """
+        if x.dtype != torch.float32:
+            x = x.float()
+        if x.max() > 1.5:
+            x = x / 255.0
+        x = self.resize(x)
+        x = self.normalize(x)
+        return x
+
+
+# ============================================================================
+# Depth Positional Encoding (SD-VLM Style)
+# ============================================================================
+
+
+def depth_sincos_encoding(
+    img_features: torch.Tensor, depth_features: list[torch.Tensor]
+) -> torch.Tensor:
+    """SD-VLM-style depth sinusoidal encoding.
+
+    Implements depth_sincos_encoding from llava_arch.py, adapted for Isaac's format.
+    Depth features are concatenated, reshaped, and encoded using sinusoidal functions.
+
+    Args:
+        img_features: Image features tensor of shape (B, L, dim)
+        depth_features: List of depth feature tensors, one per image
+
+    Returns:
+        Image features with depth positional encoding added (additive fusion)
+    """
+    if len(depth_features) == 0:
+        return img_features
+
+    # Concatenate depth features (SD-VLM pattern)
+    depth_features_cat = torch.cat(depth_features, dim=0)
+    depth_features_flat = depth_features_cat.reshape(depth_features_cat.shape[0], -1)
+
+    B, L, dim = img_features.shape
+    assert dim % 2 == 0, f"embed_dim must be even, got {dim}"
+
+    # Create position embedding tensor
+    position_embedding = torch.zeros(
+        B, L, dim, dtype=img_features.dtype, device=depth_features_flat.device
+    )
+
+    # Compute frequencies: omega = 1/(10000^(2i/dim))
+    omega = torch.arange(dim // 2, dtype=img_features.dtype, device=depth_features_flat.device)
+    omega /= dim / 2.0
+    omega = 1.0 / (10000**omega)
+
+    # Compute phase: sita = depth_features @ omega
+    sita = depth_features_flat[:, :, None] @ omega[None, :].to(
+        depth_features_flat.device
+    ).to(depth_features_flat.dtype)
+
+    # Compute sin and cos
+    emb_sin = torch.sin(sita)
+    emb_cos = torch.cos(sita)
+
+    # Interleave sin and cos: [sin[0], cos[0], sin[1], cos[1], ...]
+    position_embedding[:, :, 0::2] = emb_sin
+    position_embedding[:, :, 1::2] = emb_cos
+
+    # Additive fusion (SD-VLM pattern)
+    return position_embedding.to(img_features.device) + img_features
 
 
 class DepthPositionalEncoding(nn.Module):
@@ -190,70 +289,12 @@ def make_depth_pe_for_isaac(
 
 
 # ============================================================================
-# Modified Vision Transformer with Depth Support
+# Extended Config with Depth Support
 # ============================================================================
 
-
-class Siglip2SequenceVisionTransformer(nn.Module):
-    """Vision transformer for extracting visual features from image patches."""
-
-    def __init__(self, config: PixelShuffleSiglip2VisionConfig):
-        super().__init__()
-        self.config = config
-        self.embeddings = Siglip2VariableSequenceEmbeddings(config)
-        self.encoder = IsaacEncoder(config)
-        self.post_layernorm = nn.LayerNorm(
-            config.hidden_size, eps=config.layer_norm_eps
-        )
-        self.pixel_shuffle_scale_factor = config.pixel_shuffle_scale_factor
-
-    def forward(
-        self,
-        packed_seq_patches: tuple[torch.Tensor, torch.Tensor],
-    ):
-        """Forward pass to extract vision features.
-
-        Args:
-            packed_seq_patches: Tuple of (seq_patches, token_grids)
-
-        Returns:
-            Vision embeddings from the transformer
-        """
-        seq_patches, token_grids = packed_seq_patches
-        seq_sizes = torch.prod(token_grids, dim=-1)
-
-        # Get embeddings from packed sequence
-        hidden_states = self.embeddings((seq_patches, seq_sizes, token_grids))
-
-        # Add a pseudo batch dimension for the encoder
-        hidden_states = hidden_states.unsqueeze(0)
-
-        # Generate cumulative sequence lengths for variable-length attention
-        cu_seqlens, max_seqlen = create_cumulative_seq_lengths(
-            seq_sizes, hidden_states.device
-        )
-
-        # Pass through encoder with variable-length attention parameters
-        hidden_states, _, _ = self.encoder(
-            inputs_embeds=hidden_states,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-        )
-
-        # Apply final layer normalization
-        hidden_states = self.post_layernorm(hidden_states)
-
-        if self.pixel_shuffle_scale_factor > 1:
-            hidden_states = pixel_shuffle_varlen(
-                x=hidden_states,
-                token_grids=token_grids,
-                scale_factor=self.pixel_shuffle_scale_factor,
-            )
-        # Remove the pseudo batch dimension we added earlier
-        hidden_states = hidden_states.squeeze(0)
-
-        # Return the full sequence of embeddings
-        return hidden_states
+# Extend IsaacConfig to add depth parameters
+# We'll create a wrapper or extend it here
+# For now, we'll access depth parameters via getattr with defaults
 
 
 # ============================================================================
@@ -320,6 +361,11 @@ class IsaacProcessor(ProcessorMixin):
         image_idx = 0
         for current_time, part in enumerate(parts):
             if part == self.vision_token:
+                # Validate that images are provided when vision token is found
+                if images is None:
+                    raise ValueError(
+                        f"Found vision token {self.vision_token} in text but no images were provided."
+                    )
                 # Replace vision token with image event
                 if image_idx < len(images):
                     # Create vision event from PIL image
@@ -489,14 +535,15 @@ class IsaacDepthModel(Qwen3Model):
         self.rotary_emb = IsaacRotaryEmbedding(config, device=self.device)
 
         vision_cfg = config.vision_config
+        # Fix: Check for None BEFORE accessing _attn_implementation
+        if vision_cfg is None:
+            raise ValueError("IsaacConfig should always have vision_config")
         # Use vision_attn_implementation if specified, otherwise fall back to general attn_implementation
         vision_cfg._attn_implementation = (
             config.vision_attn_implementation
             if config.vision_attn_implementation is not None
             else config._attn_implementation
         )
-        if vision_cfg is None:
-            raise ValueError("IsaacConfig should always have vision_config")
 
         hidden_dim = vision_cfg.hidden_size * (vision_cfg.pixel_shuffle_scale_factor**2)
 
@@ -513,34 +560,57 @@ class IsaacDepthModel(Qwen3Model):
             nn.Linear(4 * hidden_dim, config.hidden_size, bias=False),
         )
 
-        # Initialize depth model and DPE module for depth-aware vision encoding
-        self.depth_model = DepthAnythingV2(encoder="vitl")
+        # Initialize depth model and preprocessing only if use_depth is enabled
+        self.use_depth = getattr(config, 'use_depth', True)
+        self.depth_alpha = getattr(config, 'depth_alpha', 100.0)
+        self.depth_input_size = getattr(config, 'depth_input_size', 518)
 
-        # Load pretrained DepthAnythingV2 weights if available
-        depth_checkpoint_path = getattr(config, 'depth_checkpoint_path', None)
-        if depth_checkpoint_path is not None:
-            import os
-            if os.path.exists(depth_checkpoint_path):
-                print(f"Loading DepthAnythingV2 weights from: {depth_checkpoint_path}")
-                checkpoint = torch.load(depth_checkpoint_path, map_location='cpu')
-                self.depth_model.load_state_dict(checkpoint)
-                print("✓ DepthAnythingV2 weights loaded successfully")
+        if self.use_depth:
+            # Initialize depth model
+            self.depth_model = DepthAnythingV2(encoder="vitl")
+
+            # Load pretrained DepthAnythingV2 weights if available
+            depth_checkpoint_path = getattr(config, 'depth_checkpoint_path', None)
+            if depth_checkpoint_path is not None:
+                import os
+                if os.path.exists(depth_checkpoint_path):
+                    print(f"Loading DepthAnythingV2 weights from: {depth_checkpoint_path}")
+                    checkpoint = torch.load(depth_checkpoint_path, map_location='cpu')
+                    # Defensive state_dict extraction
+                    state_dict = checkpoint
+                    if "model" in checkpoint:
+                        state_dict = checkpoint["model"]
+                    elif "state_dict" in checkpoint:
+                        state_dict = checkpoint["state_dict"]
+                    self.depth_model.load_state_dict(state_dict, strict=False)
+                    print("✓ DepthAnythingV2 weights loaded successfully")
+                else:
+                    print(f"Warning: Depth checkpoint not found at {depth_checkpoint_path}")
+                    print("Depth model will use random initialization")
             else:
-                print(f"Warning: Depth checkpoint not found at {depth_checkpoint_path}")
+                print("Warning: No depth_checkpoint_path specified in config")
                 print("Depth model will use random initialization")
+
+            self.depth_model.eval()  # Keep depth model in eval mode
+            for param in self.depth_model.parameters():
+                param.requires_grad = False  # Freeze depth model
+
+            # Move depth model to device (Fix: Bug #1.1)
+            self.depth_model.to(self.device)
+
+            # Initialize depth preprocessing module
+            self.depth_preproc = IsaacDepthPreproc(input_size=self.depth_input_size).to(self.device)
+
+            # Depth positional encoding module - uses LLM hidden_size (SD-VLM approach)
+            # Depth is added AFTER vision projection, in LLM hidden space
+            self.dpe_module = DepthPositionalEncoding(embed_dim=config.hidden_size).to(self.device)
         else:
-            print("Warning: No depth_checkpoint_path specified in config")
-            print("Depth model will use random initialization")
-
-        self.depth_model.eval()  # Keep depth model in eval mode
-        for param in self.depth_model.parameters():
-            param.requires_grad = False  # Freeze depth model
-
-        # Depth positional encoding module - uses LLM hidden_size (SD-VLM approach)
-        # Depth is added AFTER vision projection, in LLM hidden space
-        self.dpe_module = DepthPositionalEncoding(embed_dim=config.hidden_size)
+            self.depth_model = None
+            self.depth_preproc = None
+            self.dpe_module = None
 
         # Dispatch table for TensorStream balanced embedding (text + vision)
+        # Note: embed_vision is called with depth_pe separately, not through this table
         self.embed_fns = {
             TextType: self.embed_text_tokens,
             VisionType: self.embed_vision,
@@ -553,6 +623,62 @@ class IsaacDepthModel(Qwen3Model):
         if h.dim() >= 2 and h.size(-2) == 1:
             h = h[..., 0, :]
         return h
+
+    def _encode_depth(
+        self,
+        images: list[torch.Tensor],
+        target_size: tuple[int, int],
+        alpha: float = 100.0,
+    ) -> list[torch.Tensor]:
+        """Encode depth from images following SD-VLM pattern.
+
+        Args:
+            images: List of image tensors in (C, H, W) format
+            target_size: Target size (H, W) for depth maps
+            alpha: Scaling factor for depth normalization (default: 100.0)
+
+        Returns:
+            List of depth tensors, one per image
+        """
+        depths = []
+        with torch.no_grad():
+            for image in images:
+                if image is None:
+                    depth = torch.zeros(
+                        1, target_size[0], target_size[1], device=self.device
+                    )
+                else:
+                    # Ensure image is in (C, H, W) format
+                    if image.dim() == 3 and image.shape[0] != 3:
+                        # Assume (H, W, C) and permute
+                        image = image.permute(2, 0, 1)
+                    if image.dim() == 3:
+                        image = image.unsqueeze(0)  # Add batch dim
+
+                    # Preprocess for depth model
+                    image_preproc = self.depth_preproc(image)
+
+                    # Compute depth
+                    depth = self.depth_model(image_preproc)  # (1, H, W) or (1, 1, H, W)
+
+                    # Handle 4D output
+                    if depth.dim() == 4 and depth.size(1) == 1:
+                        depth = depth[:, 0]  # (1, H, W)
+
+                # Resize to target size using AdaptiveAvgPool2d (SD-VLM pattern)
+                depth = F.adaptive_avg_pool2d(
+                    depth.unsqueeze(1), target_size
+                ).squeeze(1)
+
+                # Normalize to 0-1 (SD-VLM pattern)
+                data_min = depth.min()
+                data_max = depth.max()
+                depth = (depth - data_min) / (data_max - data_min + 1e-9)
+
+                # Scale by alpha
+                depths.append(depth * alpha)
+
+        return depths
 
     def _compute_depth_pe(
         self,
@@ -568,29 +694,46 @@ class IsaacDepthModel(Qwen3Model):
         Returns:
             Depth positional encoding tensor of shape (total_patches, embed_dim) or None
         """
+        # Early return if depth is disabled
+        if not self.use_depth:
+            return None
+
         if raw_images is None or len(raw_images) == 0:
             return None
 
-        # Filter out None values from raw_images
-        valid_images = [img for img in raw_images if img is not None]
-        if len(valid_images) == 0:
+        # Fix: Option A - return None if any image is None (simpler than tracking indices)
+        if any(img is None for img in raw_images):
             return None
 
+        # Assert token_grids shape
+        assert token_grids.shape[1] == 2, "token_grids must be (N_events, 2) = (Hp, Wp)"
+
         try:
-            # Stack raw images for batch processing
-            # Expecting images in (H, W, C) format, need (B, C, H, W) for depth model
+            # Prepare images for depth computation
+            # Expecting images in (H, W, C) format, convert to (C, H, W)
             batch_images = []
-            for img in valid_images:
+            device = token_grids.device
+            for img in raw_images:
                 if img.dim() == 3:  # (H, W, C)
                     img = img.permute(2, 0, 1)  # (C, H, W)
+                # Ensure on correct device
+                img = img.to(device)
                 batch_images.append(img)
-            batch_images = torch.stack(batch_images, dim=0)  # (B, C, H, W)
 
-            # Compute depth maps using DepthAnythingV2
-            with torch.no_grad():
-                depth_maps = self.depth_model(batch_images)  # (B, H, W)
+            # Get target size from token_grids (use first image's grid size)
+            # For SD-VLM compatibility, we'll use a fixed target size like (24, 24)
+            # but adapt to token_grids for Isaac
+            target_size = tuple(token_grids[0].tolist())  # (Hp, Wp)
 
-            # Generate depth positional encodings
+            # Encode depth using SD-VLM pattern
+            depth_maps_list = self._encode_depth(
+                batch_images, target_size, alpha=self.depth_alpha
+            )
+
+            # Stack depth maps for batch processing
+            depth_maps = torch.stack(depth_maps_list, dim=0)  # (B, H, W)
+
+            # Generate depth positional encodings aligned with token grids
             depth_pe = make_depth_pe_for_isaac(
                 depth_maps, token_grids, self.dpe_module
             )  # (total_patches, embed_dim)
@@ -634,7 +777,11 @@ class IsaacDepthModel(Qwen3Model):
         # This matches SD-VLM: image_features = depth_sincos_encoding(image_features, depth_features)
         # where image_features is already in LLM hidden dimension
         if depth_pe is not None:
-            vision_features = vision_features + depth_pe.to(vision_features.dtype)
+            # Fix: Ensure device and dtype matching (Bug #1.2)
+            depth_pe = depth_pe.to(
+                device=vision_features.device, dtype=vision_features.dtype
+            )
+            vision_features = vision_features + depth_pe
 
         return vision_features
 
@@ -684,10 +831,15 @@ class IsaacDepthModel(Qwen3Model):
 
                     # Compute depth positional encoding from raw images
                     raw_imgs = raw_images.get(stream_type, None)
-                    depth_pe = self._compute_depth_pe(raw_imgs, token_grids_tensor)
+                    # Only compute depth if enabled and raw images available
+                    if self.use_depth and raw_imgs is not None:
+                        depth_pe = self._compute_depth_pe(raw_imgs, token_grids_tensor)
+                    else:
+                        depth_pe = None
 
                 # Pass precomputed depth_pe to embed_vision
-                embedded_compact[stream_type] = self.embed_fns[stream_type.modality](
+                # Call embed_vision directly to pass depth_pe keyword argument
+                embedded_compact[stream_type] = self.embed_vision(
                     input_tensor, depth_pe=depth_pe
                 )
             else:
@@ -1172,6 +1324,8 @@ __all__ = [
     "IsaacProcessor",
     "DepthPositionalEncoding",
     "make_depth_pe_for_isaac",
+    "depth_sincos_encoding",
+    "IsaacDepthPreproc",
     "DepthAnythingV2",
     "Siglip2SequenceVisionTransformer",
 ]
