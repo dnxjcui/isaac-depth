@@ -1,0 +1,45 @@
+[
+    {
+        "id": "example_1",
+        "conversations": [
+            {
+                "from": "human",
+                "value": "What objects are in this image? <image>"
+            },
+            {
+                "from": "gpt",
+                "value": "This image shows a cat sitting on a windowsill, with a plant in the background."
+            }
+        ],
+        "image": "path/to/image1.jpg"
+    },
+    {
+        "id": "example_2",
+        "conversations": [
+            {
+                "from": "human",
+                "value": "Describe the depth and spatial relationships in this scene. <image>"
+            },
+            {
+                "from": "gpt",
+                "value": "The scene shows a person in the foreground, with mountains in the background. The depth creates a sense of scale and distance."
+            }
+        ],
+        "image": "path/to/image2.jpg"
+    },
+    {
+        "id": "example_3",
+        "conversations": [
+            {
+                "from": "human",
+                "value": "What is the main subject of this image? <image>"
+            },
+            {
+                "from": "gpt",
+                "value": "The main subject is a red car parked on a street."
+            }
+        ],
+        "image": "path/to/image3.jpg"
+    }
+]
+

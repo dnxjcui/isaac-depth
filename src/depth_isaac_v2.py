@@ -99,11 +99,6 @@ from modular_isaac import (
 import torchvision.transforms as T
 
 
-# ============================================================================
-# Depth Preprocessing Module
-# ============================================================================
-
-
 class IsaacDepthPreproc(nn.Module):
     """Depth preprocessing module for DepthAnythingV2 input preparation."""
 
@@ -147,18 +142,13 @@ class IsaacDepthPreproc(nn.Module):
 # ============================================================================
 
 
-# NOTE: Legacy SD-VLM-style helper, not used in the Isaac depth pipeline below.
-# The active code path uses DepthPositionalEncoding + make_depth_pe_for_isaac instead.
 def depth_sincos_encoding(
     img_features: torch.Tensor, depth_features: list[torch.Tensor]
 ) -> torch.Tensor:
-    """SD-VLM-style depth sinusoidal encoding (LEGACY - not used in active pipeline).
+    """SD-VLM-style depth sinusoidal encoding.
 
     Implements depth_sincos_encoding from llava_arch.py, adapted for Isaac's format.
     Depth features are concatenated, reshaped, and encoded using sinusoidal functions.
-
-    NOTE: This function is not called in the current Isaac depth pipeline.
-    The active code uses DepthPositionalEncoding + make_depth_pe_for_isaac instead.
 
     Args:
         img_features: Image features tensor of shape (B, L, dim)
@@ -337,23 +327,6 @@ class IsaacProcessor(ProcessorMixin):
         self.min_num_patches = config.vision_min_num_patches
         self.pixel_shuffle_scale = config.pixel_shuffle_scale
 
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        """Load processor from pretrained model path.
-        
-        Loads tokenizer and config, then creates processor instance.
-        """
-        from transformers import AutoTokenizer
-        
-        # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
-        
-        # Load config
-        config = IsaacConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
-        
-        # Create processor
-        return cls(tokenizer=tokenizer, config=config)
-
     def apply_chat_template(
         self,
         messages: list[dict[str, Any]],
@@ -450,9 +423,10 @@ class IsaacProcessor(ProcessorMixin):
                     -1, vision_event.data.shape[-1]
                 )
 
-                # Store raw image in tags for depth computation
-                # Note: Event uses tags dict, not metadata (Event is a slots dataclass)
-                vision_event.tags['raw_image'] = raw_image.squeeze(0)  # (H, W, C)
+                # Store raw image as metadata for depth computation
+                if not hasattr(vision_event, 'metadata'):
+                    vision_event.metadata = {}
+                vision_event.metadata['raw_image'] = raw_image.squeeze(0)  # (H, W, C)
 
                 processed_vision_events.append(vision_event)
 
@@ -654,51 +628,49 @@ class IsaacDepthModel(Qwen3Model):
         """Encode depth from images following SD-VLM pattern.
 
         Args:
-            images: List of image tensors in (C, H, W) or (H, W, C) format.
-            target_size: Target size (H, W) for the *fallback* case when image is None.
-                         For real images we do NOT pool to this size here; pooling is
-                         handled later by DepthPositionalEncoding.
+            images: List of image tensors in (C, H, W) format
+            target_size: Target size (H, W) for depth maps
             alpha: Scaling factor for depth normalization (default: 100.0)
 
         Returns:
-            List of depth tensors of shape (1, H_d, W_d) per image (pre-pooling).
+            List of depth tensors, one per image
         """
         depths = []
         with torch.no_grad():
             for image in images:
                 if image is None:
-                    # For missing images, still return something with the right device.
-                    # We keep using target_size here so DepthPositionalEncoding can
-                    # safely pool or re-use this resolution.
                     depth = torch.zeros(
                         1, target_size[0], target_size[1], device=self.device
                     )
                 else:
-                    # Ensure (C, H, W)
+                    # Ensure image is in (C, H, W) format
                     if image.dim() == 3 and image.shape[0] != 3:
-                        # Assume (H, W, C)
+                        # Assume (H, W, C) and permute
                         image = image.permute(2, 0, 1)
                     if image.dim() == 3:
-                        image = image.unsqueeze(0)  # (1, C, H, W)
-                    image = image.to(self.device)
+                        image = image.unsqueeze(0)  # Add batch dim
 
-                    # Preprocess and run depth model
-                    image_preproc = self.depth_preproc(image)  # (1, C, H_d, W_d)
-                    depth = self.depth_model(image_preproc)    # (1, H_d, W_d) or (1, 1, H_d, W_d)
+                    # Preprocess for depth model
+                    image_preproc = self.depth_preproc(image)
 
-                    # Handle (1, 1, H_d, W_d) → (1, H_d, W_d)
+                    # Compute depth
+                    depth = self.depth_model(image_preproc)  # (1, H, W) or (1, 1, H, W)
+
+                    # Handle 4D output
                     if depth.dim() == 4 and depth.size(1) == 1:
-                        depth = depth[:, 0]
-                    elif depth.dim() != 3:
-                        raise ValueError(f"Unexpected depth output shape: {depth.shape}")
+                        depth = depth[:, 0]  # (1, H, W)
 
-                # Normalize per image to [0, 1], then scale by alpha
-                B = depth.shape[0]  # should be 1
-                depth_flat = depth.view(B, -1)
-                data_min = depth_flat.min(dim=1, keepdim=True)[0].view(B, 1, 1)
-                data_max = depth_flat.max(dim=1, keepdim=True)[0].view(B, 1, 1)
+                # Resize to target size using AdaptiveAvgPool2d (SD-VLM pattern)
+                depth = F.adaptive_avg_pool2d(
+                    depth.unsqueeze(1), target_size
+                ).squeeze(1)
+
+                # Normalize to 0-1 (SD-VLM pattern)
+                data_min = depth.min()
+                data_max = depth.max()
                 depth = (depth - data_min) / (data_max - data_min + 1e-9)
 
+                # Scale by alpha
                 depths.append(depth * alpha)
 
         return depths
@@ -711,13 +683,11 @@ class IsaacDepthModel(Qwen3Model):
         """Compute depth positional encoding from raw images.
 
         Args:
-            raw_images: List of raw image tensors (one per vision event),
-                        typically in (H, W, C) or (C, H, W) format.
-            token_grids: Tensor of shape (N_events, 2) with spatial dimensions (Hp, Wp)
-                         for each vision event.
+            raw_images: List of raw image tensors (one per vision event)
+            token_grids: Tensor of shape (N_events, 2) with spatial dimensions (H, W)
 
         Returns:
-            Depth positional encoding tensor of shape (total_patches, embed_dim) or None.
+            Depth positional encoding tensor of shape (total_patches, embed_dim) or None
         """
         # Early return if depth is disabled
         if not self.use_depth:
@@ -726,52 +696,43 @@ class IsaacDepthModel(Qwen3Model):
         if raw_images is None or len(raw_images) == 0:
             return None
 
-        # Simple conservative behavior: if any image is None, skip depth entirely.
-        # This avoids having to track indices into the packed sequence.
+        # Fix: Option A - return None if any image is None (simpler than tracking indices)
         if any(img is None for img in raw_images):
             return None
 
-        # token_grids is (N_events, 2) = (Hp, Wp)
+        # Assert token_grids shape
         assert token_grids.shape[1] == 2, "token_grids must be (N_events, 2) = (Hp, Wp)"
 
-        try:
-            device = self.device
+        # Prepare images for depth computation
+        # Expecting images in (H, W, C) format, convert to (C, H, W)
+        batch_images = []
+        device = token_grids.device
+        for img in raw_images:
+            if img.dim() == 3:  # (H, W, C)
+                img = img.permute(2, 0, 1)  # (C, H, W)
+            # Ensure on correct device
+            img = img.to(device)
+            batch_images.append(img)
 
-            # Move token_grids to model device
-            token_grids = token_grids.to(device=device, dtype=torch.long)
+        # Get target size from token_grids (use first image's grid size)
+        # For SD-VLM compatibility, we'll use a fixed target size like (24, 24)
+        # but adapt to token_grids for Isaac
+        target_size = tuple(token_grids[0].tolist())  # (Hp, Wp)
 
-            # Prepare images for depth computation
-            batch_images = []
-            for img in raw_images:
-                # Expecting (H, W, C) or (C, H, W)
-                if img.dim() == 3 and img.shape[-1] == 3 and img.shape[0] != 3:
-                    # (H, W, C) → (C, H, W)
-                    img = img.permute(2, 0, 1)
-                img = img.to(device)
-                batch_images.append(img)
+        # Encode depth using SD-VLM pattern
+        depth_maps_list = self._encode_depth(
+            batch_images, target_size, alpha=self.depth_alpha
+        )
 
-            # Use the first event's grid as the fallback size for None-images only.
-            # Real images will not be pooled here; pooling happens in DepthPositionalEncoding.
-            target_size = tuple(token_grids[0].tolist())  # (Hp, Wp)
+        # Stack depth maps for batch processing
+        depth_maps = torch.stack(depth_maps_list, dim=0)  # (B, H, W)
 
-            # Encode depth maps (pre-pooling)
-            depth_maps_list = self._encode_depth(
-                batch_images, target_size, alpha=self.depth_alpha
-            )  # each (1, H_d, W_d)
+        # Generate depth positional encodings aligned with token grids
+        depth_pe = make_depth_pe_for_isaac(
+            depth_maps, token_grids, self.dpe_module
+        )  # (total_patches, embed_dim)
 
-            depth_maps = torch.cat(depth_maps_list, dim=0)  # (B, H_d, W_d), B = N_events
-
-            # Generate depth positional encodings aligned with token grids
-            depth_pe = make_depth_pe_for_isaac(
-                depth_maps, token_grids, self.dpe_module
-            )  # (total_patches, embed_dim)
-
-            return depth_pe
-
-        except Exception as e:
-            # If depth computation fails, continue without depth
-            print(f"Warning: Depth computation failed: {e}. Continuing without depth.")
-            return None
+        return depth_pe
 
     def embed_vision(
         self,
@@ -834,11 +795,11 @@ class IsaacDepthModel(Qwen3Model):
         for stream in tensor_stream.streams:
             for event in stream:
                 token_grids[event.type].append(event.dims(virtual=False))
-                # Extract raw image data from event tags for depth computation
+                # Extract raw image data from event metadata for depth computation
                 if event.type.modality == VisionType:
-                    # Try to get raw image from tags
-                    if 'raw_image' in event.tags:
-                        raw_images[event.type].append(event.tags['raw_image'])
+                    # Try to get raw image from metadata
+                    if hasattr(event, 'metadata') and 'raw_image' in event.metadata:
+                        raw_images[event.type].append(event.metadata['raw_image'])
                     else:
                         # No raw image available, depth won't be computed
                         raw_images[event.type].append(None)
