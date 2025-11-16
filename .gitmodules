@@ -4,3 +4,6 @@
 [submodule "Depth-Anything-V2"]
 	path = Depth-Anything-V2
 	url = https://github.com/DepthAnything/Depth-Anything-V2
+[submodule "SD-VLM"]
+	path = SD-VLM
+	url = git@github.com:cpystan/SD-VLM.git
