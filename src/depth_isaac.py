@@ -344,12 +344,62 @@ class IsaacProcessor(ProcessorMixin):
         Loads tokenizer and config, then creates processor instance.
         """
         from transformers import AutoTokenizer
+        from pathlib import Path
         
-        # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        model_path = Path(pretrained_model_name_or_path)
+        
+        # Check if tokenizer is in a separate directory (common pattern)
+        # Try multiple possible locations
+        tokenizer_path = None
+        possible_paths = [
+            model_path / "tokenizer",  # tokenizer subdirectory
+            model_path.parent / f"{model_path.name}_tokenizer",  # sibling with model_name_tokenizer
+            model_path.parent / "isaac_tokenizer",  # common pattern: isaac_tokenizer
+            model_path.parent / "tokenizer",  # parent/tokenizer
+            model_path,  # same directory as model
+        ]
+        
+        for path in possible_paths:
+            if path.exists():
+                # Check for tokenizer files
+                has_tokenizer = (
+                    (path / "tokenizer_config.json").exists() or
+                    (path / "tokenizer.json").exists() or
+                    (path / "vocab.json").exists()
+                )
+                if has_tokenizer:
+                    tokenizer_path = path
+                    break
+        
+        # If no tokenizer found, use model path
+        if tokenizer_path is None:
+            tokenizer_path = model_path
+        
+        # Load tokenizer - use trust_remote_code=True to handle custom configs
+        # This is necessary because AutoTokenizer tries to infer tokenizer type from config
+        tokenizer_kwargs = {**kwargs}
+        if "trust_remote_code" not in tokenizer_kwargs:
+            tokenizer_kwargs["trust_remote_code"] = True
+        if "use_fast" not in tokenizer_kwargs:
+            tokenizer_kwargs["use_fast"] = False
+        
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path), **tokenizer_kwargs)
+        except (ValueError, OSError) as e:
+            # If AutoTokenizer fails (e.g., unrecognized config), try Qwen2Tokenizer directly
+            # This handles the case where tokenizer_config.json exists but AutoTokenizer
+            # can't infer the type from the model config
+            try:
+                tokenizer = Qwen2Tokenizer.from_pretrained(str(tokenizer_path), **kwargs)
+            except Exception:
+                # Re-raise original error if both fail
+                raise ValueError(
+                    f"Failed to load tokenizer from {tokenizer_path}. "
+                    f"Original error: {e}"
+                ) from e
         
         # Load config
-        config = IsaacConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        config = IsaacConfig.from_pretrained(str(model_path), **kwargs)
         
         # Create processor
         return cls(tokenizer=tokenizer, config=config)
